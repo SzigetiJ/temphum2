@@ -58,7 +58,6 @@
 // #3: Sizes
 #define TM1637_CELLS             4U
 #define TM1637_COLON_POS         1U
-#define BUTTON_ARRAY_SIZE       19U
 
 // #4 Default values
 #define DISPLAY_BRIGHTNESS_INIT 0U
@@ -92,14 +91,28 @@ typedef enum {
 } E_DISPLAY_MINMAX_STATE;
 
 typedef struct {
-  uint64_t au64tckLastInt[BUTTON_ARRAY_SIZE];
-  char acLastKnownState[BUTTON_ARRAY_SIZE];
   uint32_t abDirty;
   uint32_t abChallenge;
+  uint8_t abDirty1;
+  uint8_t abChallenge1;
+} SButtonDebounceFlags;
+
+typedef struct {
+  uint64_t u64tckPress;
+  uint64_t u64tckLastInt;
+  uint8_t u8LastKnownState;
 } SButtonState;
 
+typedef struct {
+  uint8_t u8Gpio;
+  uint64_t u64tckLongPress;
+  void (*fPress)(void *pvParam);
+  void (*fShortRelease)(void *pvParam);
+  void (*fLongRelease)(void *pvParam);
+  void *pvParam;
+} SButtonActions;
+
 // ================ Local function declarations =================
-void _dht22_run_ready_cb(void *pvParam, SDht22Data *psParam);
 static void _alive_blink_init();
 static void _alive_blink_cycle(uint64_t u64tckNow);
 
@@ -110,6 +123,10 @@ static void _configure_button(uint8_t u8Gpio);
 static void _button_init();
 static void _button_cycle(uint64_t u64tckNow);
 static void _button_isr(void *pvParam);
+static void _button0off(void *pvParam);
+static void _button0offlong(void *pvParam);
+static void _button2off(void *pvParam);
+static void _button2offlong(void *pvParam);
 
 static void _display_init();
 static void _display_cycle(uint64_t u64tckNow);
@@ -118,12 +135,14 @@ static void _asciiseq_to_seg7(uint8_t *pu8Dst, const char *pcSrc, uint8_t u8Len)
 static void _num_to_asciiseq(char *pcDst, uint16_t u16Num, uint8_t u8Len);
 static void _i16_to_asciiseq(char *pcDst, int16_t i16Value, bool bTemp);
 
+static void _dht22_run_ready_cb(void *pvParam, SDht22Data *psParam);
 static void _dht22_init();
 static void _dht22_cycle(uint64_t u64tckNow);
 
 static void _measproc_init();
 static void _measproc_cycle(uint64_t u64tckNow);
 
+static void _measlog_cycle(uint64_t u64tckNow);
 
 // =================== Global constants ================
 const bool gbStartAppCpu = START_APP_CPU;
@@ -131,10 +150,14 @@ const uint16_t gu16Tim00Divisor = TIM0_0_DIVISOR;
 const uint64_t gu64tckSchedulePeriod = (CLK_FREQ_HZ / SCHEDULE_FREQ_HZ);
 
 // ==================== Local Data ================
-//static const TimerId gsTimer = {.eTimg = TIMG_0, .eTimer = TIMER0};
 
 // button data
-static SButtonState gsButtonState;
+DRAM_ATTR static SButtonDebounceFlags gsButtonFlags;
+const SButtonActions gasButtonActions[] = {
+  {BUTTON0_GPIO, MS2TICKS(1000), NULL, _button0off, _button0offlong, NULL},
+  {BUTTON2_GPIO, MS2TICKS(1000), NULL, _button2off, _button2offlong, NULL}
+};
+static SButtonState gasButtonState[ARRAY_SIZE(gasButtonActions)];
 
 // display data
 const uint8_t gau8NumToSeg[] = {0x3f, 0x06, 0x5b, 0x4f, 0x66, 0x6d, 0x7d, 0x07, 0x7f, 0x6f, 0x77, 0x7c, 0x39, 0x5e, 0x79, 0x71};
@@ -208,8 +231,10 @@ static void _alive_blink_cycle(uint64_t u64tckNow) {
 // BUTTON section
 
 IRAM_ATTR static void _button_isr(void *pvParam) {
-  gsButtonState.abDirty |= gsGPIO.STATUS;
+  gsButtonFlags.abDirty |= gsGPIO.STATUS;
+  gsButtonFlags.abDirty1 |= gsGPIO.STATUS1 & 0xFF;
   gsGPIO.STATUS_W1TC = -1;
+  gsGPIO.STATUS1_W1TC = -1;
   gsUART0.FIFO = '%';
 }
 
@@ -228,12 +253,15 @@ static void _button_init() {
   // setup iomux & gpio regs
   _configure_button(BUTTON0_GPIO);
   _configure_button(BUTTON2_GPIO);
-  for (int i = 0; i < BUTTON_ARRAY_SIZE; ++i) {
-    gsButtonState.au64tckLastInt[i] = 0;
-    gsButtonState.acLastKnownState[i] = 0; // off
+  for (int i = 0; i < ARRAY_SIZE(gasButtonActions); ++i) {
+    gasButtonState[i].u64tckLastInt = 0;
+    gasButtonState[i].u64tckPress = 0;
+    gasButtonState[i].u8LastKnownState = 1; // high
   }
-  gsButtonState.abDirty = 0;
-  gsButtonState.abChallenge = 0;
+  gsButtonFlags.abDirty = 0U;
+  gsButtonFlags.abDirty1 = 0U;
+  gsButtonFlags.abChallenge = 0U;
+  gsButtonFlags.abChallenge1 = 0U;
 
   // register ISR and enable it
   ECpu eCpu = CPU_PRO;
@@ -246,49 +274,67 @@ static void _button_init() {
 
 static void _button_cycle(uint64_t u64tckNow) {
   static uint64_t u64tckNext = 0;
+  static uint32_t u32ChallengeCycles = 0; // debug variable
+
   if (u64tckNext <= u64tckNow) {
-    // TODO: disable BUTTON interrupt
+    // disable GPIO interrupt
+    uint32_t u32IntEn = gsGPIO.ENABLE;
+    uint32_t u32IntEn1 = gsGPIO.ENABLE1;
+    gsGPIO.ENABLE = 0;
+    gsGPIO.ENABLE1 = 0;
 
     // check changes
-    if (gsButtonState.abDirty) {
-      for (int i = 0; i < BUTTON_ARRAY_SIZE; ++i) {
-        if (gsButtonState.abDirty & (1 << i)) {
-          gsButtonState.au64tckLastInt[i] = u64tckNow;
+    if (gsButtonFlags.abDirty | gsButtonFlags.abDirty1) {
+      for (int i = 0; i < ARRAY_SIZE(gasButtonState); ++i) {
+        uint8_t u8Byte = gasButtonActions[i].u8Gpio >> 5;
+        uint8_t u8Bit = gasButtonActions[i].u8Gpio & 0x1F;
+        if ((u8Byte ? gsButtonFlags.abDirty1 : gsButtonFlags.abDirty) & (1 << u8Bit)) {
+          gasButtonState[i].u64tckLastInt = u64tckNow;
         }
       }
-      gsButtonState.abChallenge |= gsButtonState.abDirty;
+      gsButtonFlags.abChallenge |= gsButtonFlags.abDirty;
+      gsButtonFlags.abChallenge1 |= gsButtonFlags.abDirty1;
     }
-    gsButtonState.abDirty = 0;
+    gsButtonFlags.abDirty = 0U;
+    gsButtonFlags.abDirty1 = 0U;
 
     // challenge changes after a while
-    if (gsButtonState.abChallenge) {
-      for (int i = 0; i < BUTTON_ARRAY_SIZE; ++i) {
-        if ((gsButtonState.abChallenge & (1 << i)) &&
-                (gsButtonState.au64tckLastInt[i] < u64tckNow)) {
-          gsButtonState.abChallenge &= ~(1 << i);
-          bool bLevel = gpio_pin_read(i);
-          if (bLevel != gsButtonState.acLastKnownState[i]) {  // significant change!
-            gsButtonState.acLastKnownState[i] = bLevel;
+    if (gsButtonFlags.abChallenge || gsButtonFlags.abChallenge1) {
+      ++u32ChallengeCycles;
+      for (int i = 0; i < ARRAY_SIZE(gasButtonState); ++i) {
+        uint8_t u8Byte = gasButtonActions[i].u8Gpio >> 5;
+        uint8_t u8Bit = gasButtonActions[i].u8Gpio & 0x1F;
+        if ((u8Byte ? gsButtonFlags.abChallenge1 : gsButtonFlags.abChallenge) & (1 << u8Bit) &&
+                (gasButtonState[i].u64tckLastInt < u64tckNow)) {
+          if (u8Byte)
+            gsButtonFlags.abChallenge1 &= ~(1 << u8Bit);
+          else
+            gsButtonFlags.abChallenge &= ~(1 << u8Bit);
+          bool bLevel = gpio_pin_read(gasButtonActions[i].u8Gpio);
+          if (bLevel != gasButtonState[i].u8LastKnownState) {  // significant change!
+            gasButtonState[i].u8LastKnownState = bLevel;
 
-            // actions
-            if (i == BUTTON0_GPIO) {
-              gsUART0.FIFO = bLevel ? 'B' : 'b';
-              gsUART0.FIFO = '0';
-              if (!bLevel) {
-                geDisplayMMState = DISPLAY_MM_ANNOUNCETEMP;
-                geDisplayMajorState = DISPLAY_MINMAX;
+            uart_printf(&gsUART0, "Button#%u %s", gasButtonActions[i].u8Gpio, bLevel ? "released" : "pressed");
+            if (bLevel == 0) {  // pressed
+              gasButtonState[i].u64tckPress = u64tckNow;
+              if (gasButtonActions[i].fPress != NULL) {
+                gasButtonActions[i].fPress(gasButtonActions[i].pvParam);
               }
-            } else if (i == BUTTON2_GPIO) {
-              gsUART0.FIFO = bLevel ? 'B' : 'b';
-              gsUART0.FIFO = '2';
-              if (!bLevel) {
-                uint8_t u8Curr = gsTm1637State.u8Brightness & 7;
-                ++u8Curr;
-                gsTm1637State.u8Brightness = 0x08 | (u8Curr & 7);
-                gbTm1637FullFlushRequired = true;
-                gbMeasLog = true;
+            } else {  // release
+              uint64_t u64tckPressDuration = u64tckNow - gasButtonState[i].u64tckPress;
+              if (gasButtonActions[i].u64tckLongPress <= u64tckPressDuration) { // long press
+                uart_printf(&gsUART0, " (long)");
+                if (gasButtonActions[i].fLongRelease != NULL) {
+                  gasButtonActions[i].fLongRelease(gasButtonActions[i].pvParam);
+                }
+              } else {  // short press
+                if (gasButtonActions[i].fShortRelease != NULL) {
+                  gasButtonActions[i].fShortRelease(gasButtonActions[i].pvParam);
+                }
               }
             }
+            // debug
+            uart_printf(&gsUART0, " %u %02X %08X\r\n", u32ChallengeCycles, gsButtonFlags.abChallenge1, gsButtonFlags.abChallenge);
           } else {  // only one or more spikes
 
           }
@@ -296,16 +342,39 @@ static void _button_cycle(uint64_t u64tckNow) {
       }
 
     }
-    // TODO: BUTTON interrupt
+    // enable GPIO interrupt
+    gsGPIO.ENABLE = u32IntEn;
+    gsGPIO.ENABLE1 = u32IntEn1;
 
     u64tckNext += MS2TICKS(BUTTONCHECK_PERIOD_MS);
   }
 }
 
+static void _button0off(void *pvParam) {
+  geDisplayMMState = DISPLAY_MM_ANNOUNCETEMP;
+  geDisplayMajorState = DISPLAY_MINMAX;
+}
+
+static void _button0offlong(void *pvParam) {
+  uart_printf(&gsUART0, "Entering config...\r\n");
+}
+
+static void _button2off(void *pvParam) {
+  uint8_t u8Curr = gsTm1637State.u8Brightness & 7;
+  uint8_t u8Next = (u8Curr + 1) & 7;
+  gsTm1637State.u8Brightness = 0x08 | u8Next;
+  gbTm1637FullFlushRequired = true;
+  uart_printf(&gsUART0, "Display brightness: %u\r\n", u8Next);
+}
+
+static void _button2offlong(void *pvParam) {
+  gbMeasLog = true;
+}
+
 ///////////////////////////
 // DISPLAY section
 
-static void _display_ready(void *pvParam) {
+IRAM_ATTR static void _display_ready(void *pvParam) {
   // nothing to do
 }
 
@@ -452,6 +521,7 @@ static void _i16_to_asciiseq(char *pcDst, int16_t i16Value, bool bTemp) {
 
 static void _measlog_cycle(uint64_t u64tckNow) {
   static uint64_t u64tckNext = MS2TICKS(MEASLOG_IDLE_PERIOD_MS);
+
   if (u64tckNext <= u64tckNow) {
     if (gbMeasLog) {
       if (gu8MeasLogDayIdx < 24) {
@@ -502,6 +572,9 @@ static void _measlog_cycle(uint64_t u64tckNow) {
     u64tckNext += MS2TICKS(MEASLOG_PERIOD_MS);
   }
 }
+
+////////////////////////////////////
+// MEASUREMENT PROCESSING section
 
 static void _measproc_init() {
   gsTemp = statstore_init(TEMPSTORE_BASE);
@@ -571,7 +644,10 @@ static void _measproc_cycle(uint64_t u64tckNow) {
   }
 }
 
-void _dht22_run_ready_cb(void *pvParam, SDht22Data * psParam) {
+/////////////////////
+// DHT22 section
+
+IRAM_ATTR static void _dht22_run_ready_cb(void *pvParam, SDht22Data * psParam) {
   gbDht22ResultReady = true;
   gpio_pin_out_off(LED1_GPIO);
 
