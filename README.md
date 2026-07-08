@@ -1,6 +1,28 @@
-## Displaying Temperature and Relative Humidity Measurements with ESP32.
+## Temperature and Humidity
 
-## Installation
+![GitHub](https://img.shields.io/github/license/SzigetiJ/temphum2)
+<!--![C/C++ CI](https://github.com/SzigetiJ/temphum2/workflows/C/C++%20CI/badge.svg)-->
+[![GitHub code size](https://img.shields.io/github/languages/code-size/SzigetiJ/temphum2)](https://github.com/SzigetiJ/temphum2)
+![GitHub repo size](https://img.shields.io/github/repo-size/SzigetiJ/temphum2)
+![GitHub commit activity](https://img.shields.io/github/commit-activity/y/SzigetiJ/temphum2)
+![GitHub issues](https://img.shields.io/github/issues/SzigetiJ/temphum2)
+![GitHub closed issues](https://img.shields.io/github/issues-closed/SzigetiJ/temphum2)
+
+This is a small **ESP32 application** displaying real-time temperature and relative humidity information
+on a 4-digit 7 segment display.
+The applied temperature and humidity sensor is **DHT22**,
+The 4-digit 7 segment display is **TM1637**.
+The application is based on [ESP32Basic](https://github.com/SzigetiJ/esp32basic) lightweight framework
+(i.e., it does **not** depend on *ESP-IDF*).
+
+Note, both projects (esp32basic and this one) are in development phase,
+and the version-dependency is not set yet.
+
+## Hardware setup
+
+The required components, wiring, etc. are described in [src/README.md](src).
+
+## Software Installation
 
 ### Get the source
 
@@ -42,7 +64,6 @@ In order to use the `xtensa-esp-elf` toolchain, you have to call the configure s
 `--host=xtensa-esp32-elf`. Also set option `host_alias=xtensa-esp32-elf`.
 Further reading: [online manual](https://www.gnu.org/savannah-checkouts/gnu/autoconf/manual/autoconf-2.70/html_node/Hosts-and-Cross_002dCompilation.html#Hosts-and-Cross_002dCompilation).
 
-
 * This project depends on `esp32basic` (libs and headers).
 You have to specify the installation location of `esp32basic`:
 `--with-e32bdir=PATH_TO_ESP32BASIC_INSTALLATION`.
@@ -69,7 +90,3 @@ To install (i.e., write the binary to the ESP32 board) via UART, you can use `sc
 ```
  ../../scripts/flash.sh src/temphum.bin
 ```
-
-### Connections, Wiring, Control, etc.
-
-See [src/README.md](src/README.md).
