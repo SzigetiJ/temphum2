@@ -28,8 +28,10 @@
 
 // =================== Hard constants =================
 // #1: Timings
-#define RMTDHT_PERIOD_MS      2000U
-#define DISPLAY_DELAY_MS       100U
+#define BUTTONCHECK_PERIOD_MS   10U
+#define DHT22_PERIOD_MS       2000U
+#define DISPLAY_INITDELAY_MS   100U
+#define DISPLAY_INITPERIOD_MS  200U
 #define DISPLAY_PERIOD_MS     1000U
 #define UART_FREQ_HZ        115200U
 #define ALIVE_BLINK_PERIOD_MS 5000U
@@ -56,46 +58,45 @@
 // #3: Sizes
 #define TM1637_CELLS             4U
 #define TM1637_COLON_POS         1U
+#define BUTTON_ARRAY_SIZE       19U
 
 // #4 Default values
+#define DISPLAY_BRIGHTNESS_INIT 0U
 #define TEMPSTORE_BASE 200
 #define RHUMSTORE_BASE 500
+#define SEG7_t 0x78
+#define SEG7_h 0x74
+
 
 // ============= Local types ===============
 
 typedef enum {
-  TM1637_INIT = 0,
-  TM1637_REGULAR,
-  TM1637_MINMAX
-} E_TM1637_MAJOR_STATE;
+  DISPLAY_INIT = 0,
+  DISPLAY_REGULAR,
+  DISPLAY_MINMAX
+} E_DISPLAY_MAJOR_STATE;
 
 typedef enum {
-  TM1637REG_TEMP = 0,
-  TM1637REG_HUM
-} E_TM1637_REGULAR_STATE;
+  DISPLAY_REGULAR_TEMP = 0,
+  DISPLAY_REGULAR_RHUM
+} E_DISPLAY_REGULAR_STATE;
 
 typedef enum {
-  TM1637MM_ANNOUNCETEMP = 0,
-  TM1637MM_TEMPMIN,
-  TM1637MM_TEMPMAX,
-  TM1637MM_ANNOUNCERHUM,
-  TM1637MM_RHUMMIN,
-  TM1637MM_RHUMMAX,
-  TM1637MM_NIL
-} E_TM1637_MINMAX_STATE;
+  DISPLAY_MM_ANNOUNCETEMP = 0,
+  DISPLAY_MM_TEMPMIN,
+  DISPLAY_MM_TEMPMAX,
+  DISPLAY_MM_ANNOUNCERHUM,
+  DISPLAY_MM_RHUMMIN,
+  DISPLAY_MM_RHUMMAX,
+  DISPLAY_MM_NIL
+} E_DISPLAY_MINMAX_STATE;
 
 typedef struct {
-  int16_t min;
-  int16_t max;
-  int16_t cur;
-  bool bValid;
-} S_MINMAXCUR;
-
-typedef struct {
-  STm1637State *psState;
-  uint64_t u64tckStart;
-} SReadyCbParam;
-
+  uint64_t au64tckLastInt[BUTTON_ARRAY_SIZE];
+  char acLastKnownState[BUTTON_ARRAY_SIZE];
+  uint32_t abDirty;
+  uint32_t abChallenge;
+} SButtonState;
 
 // ================ Local function declarations =================
 void _dht22_run_ready_cb(void *pvParam, SDht22Data *psParam);
@@ -107,6 +108,7 @@ static inline IomuxGpioConfReg _iomux_gpioconfreg(uint32_t u3McuSel, uint32_t u2
         uint32_t u2FunWPUD, uint32_t u2McuDrv, uint32_t u1McuIE, uint32_t u2McuWPUD, uint32_t u1SlpSel, uint32_t u1McuOE);
 static void _configure_button(uint8_t u8Gpio);
 static void _button_init();
+static void _button_cycle(uint64_t u64tckNow);
 static void _button_isr(void *pvParam);
 
 static void _display_init();
@@ -129,7 +131,10 @@ const uint16_t gu16Tim00Divisor = TIM0_0_DIVISOR;
 const uint64_t gu64tckSchedulePeriod = (CLK_FREQ_HZ / SCHEDULE_FREQ_HZ);
 
 // ==================== Local Data ================
-static const TimerId gsTimer = {.eTimg = TIMG_0, .eTimer = TIMER0};
+//static const TimerId gsTimer = {.eTimg = TIMG_0, .eTimer = TIMER0};
+
+// button data
+static SButtonState gsButtonState;
 
 // display data
 const uint8_t gau8NumToSeg[] = {0x3f, 0x06, 0x5b, 0x4f, 0x66, 0x6d, 0x7d, 0x07, 0x7f, 0x6f, 0x77, 0x7c, 0x39, 0x5e, 0x79, 0x71};
@@ -137,11 +142,10 @@ const uint8_t gau8NumToSeg[] = {0x3f, 0x06, 0x5b, 0x4f, 0x66, 0x6d, 0x7d, 0x07, 
 static uint8_t gau8Tm1637Data[TM1637_CELLS];
 static bool gbTm1637FullFlushRequired = true;
 static STm1637State gsTm1637State;
-static SReadyCbParam gsReadyData;
 
 // what is displayed - states
-static E_TM1637_MAJOR_STATE geDisplayMajorState = TM1637_INIT;
-static E_TM1637_MINMAX_STATE geDisplayMMState;
+static E_DISPLAY_MAJOR_STATE geDisplayMajorState = DISPLAY_INIT;
+static E_DISPLAY_MINMAX_STATE geDisplayMMState;
 
 // T/RH measurement data
 static SDht22Descriptor gsDht22Desc;
@@ -204,30 +208,9 @@ static void _alive_blink_cycle(uint64_t u64tckNow) {
 // BUTTON section
 
 IRAM_ATTR static void _button_isr(void *pvParam) {
-  bool bButton0Event = gsGPIO.STATUS & (1 << BUTTON0_GPIO);
-  bool bButton2Event = gsGPIO.STATUS & (1 << BUTTON2_GPIO);
-  if (bButton0Event) {
-    gsGPIO.STATUS_W1TC = (1 << BUTTON0_GPIO);
-    bool bLevel = gsGPIO.IN & (1 << BUTTON0_GPIO);
-    gsUART0.FIFO = bLevel ? '^' : '_';
-    if (!bLevel) {
-      geDisplayMMState = TM1637MM_ANNOUNCETEMP;
-      geDisplayMajorState = TM1637_MINMAX;
-    }
-  }
-
-  if (bButton2Event) {
-    gsGPIO.STATUS_W1TC = (1 << BUTTON2_GPIO);
-    bool bLevel = gsGPIO.IN & (1 << BUTTON2_GPIO);
-    gsUART0.FIFO = bLevel ? '*' : 'x';
-    if (!bLevel) {
-      uint8_t u8Curr = gsTm1637State.u8Brightness & 7;
-      ++u8Curr;
-      gsTm1637State.u8Brightness = 0x08 | (u8Curr & 7);
-      gbTm1637FullFlushRequired = true;
-      gbMeasLog = true;
-    }
-  }
+  gsButtonState.abDirty |= gsGPIO.STATUS;
+  gsGPIO.STATUS_W1TC = -1;
+  gsUART0.FIFO = '%';
 }
 
 static void _configure_button(uint8_t u8Gpio) {
@@ -245,6 +228,12 @@ static void _button_init() {
   // setup iomux & gpio regs
   _configure_button(BUTTON0_GPIO);
   _configure_button(BUTTON2_GPIO);
+  for (int i = 0; i < BUTTON_ARRAY_SIZE; ++i) {
+    gsButtonState.au64tckLastInt[i] = 0;
+    gsButtonState.acLastKnownState[i] = 0; // off
+  }
+  gsButtonState.abDirty = 0;
+  gsButtonState.abChallenge = 0;
 
   // register ISR and enable it
   ECpu eCpu = CPU_PRO;
@@ -255,6 +244,64 @@ static void _button_init() {
   ets_isr_unmask(1 << BUTTONINT_CH);
 }
 
+static void _button_cycle(uint64_t u64tckNow) {
+  static uint64_t u64tckNext = 0;
+  if (u64tckNext <= u64tckNow) {
+    // TODO: disable BUTTON interrupt
+
+    // check changes
+    if (gsButtonState.abDirty) {
+      for (int i = 0; i < BUTTON_ARRAY_SIZE; ++i) {
+        if (gsButtonState.abDirty & (1 << i)) {
+          gsButtonState.au64tckLastInt[i] = u64tckNow;
+        }
+      }
+      gsButtonState.abChallenge |= gsButtonState.abDirty;
+    }
+    gsButtonState.abDirty = 0;
+
+    // challenge changes after a while
+    if (gsButtonState.abChallenge) {
+      for (int i = 0; i < BUTTON_ARRAY_SIZE; ++i) {
+        if ((gsButtonState.abChallenge & (1 << i)) &&
+                (gsButtonState.au64tckLastInt[i] < u64tckNow)) {
+          gsButtonState.abChallenge &= ~(1 << i);
+          bool bLevel = gpio_pin_read(i);
+          if (bLevel != gsButtonState.acLastKnownState[i]) {  // significant change!
+            gsButtonState.acLastKnownState[i] = bLevel;
+
+            // actions
+            if (i == BUTTON0_GPIO) {
+              gsUART0.FIFO = bLevel ? 'B' : 'b';
+              gsUART0.FIFO = '0';
+              if (!bLevel) {
+                geDisplayMMState = DISPLAY_MM_ANNOUNCETEMP;
+                geDisplayMajorState = DISPLAY_MINMAX;
+              }
+            } else if (i == BUTTON2_GPIO) {
+              gsUART0.FIFO = bLevel ? 'B' : 'b';
+              gsUART0.FIFO = '2';
+              if (!bLevel) {
+                uint8_t u8Curr = gsTm1637State.u8Brightness & 7;
+                ++u8Curr;
+                gsTm1637State.u8Brightness = 0x08 | (u8Curr & 7);
+                gbTm1637FullFlushRequired = true;
+                gbMeasLog = true;
+              }
+            }
+          } else {  // only one or more spikes
+
+          }
+        }
+      }
+
+    }
+    // TODO: BUTTON interrupt
+
+    u64tckNext += MS2TICKS(BUTTONCHECK_PERIOD_MS);
+  }
+}
+
 ///////////////////////////
 // DISPLAY section
 
@@ -263,25 +310,25 @@ static void _display_ready(void *pvParam) {
 }
 
 static void _display_cycle(uint64_t u64tckNow) {
-  static uint64_t u64NextTick = MS2TICKS(DISPLAY_DELAY_MS);
-  static E_TM1637_REGULAR_STATE eRegState = TM1637REG_TEMP;
+  static uint64_t u64NextTick = MS2TICKS(DISPLAY_INITDELAY_MS);
+  static E_DISPLAY_REGULAR_STATE eRegState = DISPLAY_REGULAR_TEMP;
   static int8_t i8InitScrollOffset = -3;
   char acDispData[TM1637_CELLS];
 
   if (u64NextTick <= u64tckNow) {
     switch (geDisplayMajorState) {
-      case TM1637_INIT: // scroll nums right to left
+      case DISPLAY_INIT: // scroll nums right to left
         for (int i = 0; i < TM1637_CELLS; ++i) {
           int idx = i + i8InitScrollOffset;
           gau8Tm1637Data[i] = ((idx < 0 || ARRAY_SIZE(gau8NumToSeg) <= idx) ? 0 : gau8NumToSeg[idx]);
         }
         ++i8InitScrollOffset;
         if (18 < i8InitScrollOffset) {
-          geDisplayMajorState = TM1637_REGULAR;
+          geDisplayMajorState = DISPLAY_REGULAR;
         }
         break;
-      case TM1637_MINMAX:
-        if (geDisplayMMState == TM1637MM_TEMPMIN) {
+      case DISPLAY_MINMAX:
+        if (geDisplayMMState == DISPLAY_MM_TEMPMIN) {
           gbTm1637FullFlushRequired = true;
         }
         bool bAnnounce = (geDisplayMMState % 3 == 0);
@@ -289,7 +336,7 @@ static void _display_cycle(uint64_t u64tckNow) {
         bool bMax = (geDisplayMMState % 3 == 2);
         if (bAnnounce) {
           for (int i = 0; i < TM1637_CELLS; ++i) gau8Tm1637Data[i] = 0;
-          gau8Tm1637Data[TM1637_COLON_POS] = (bTemp ? 0xf8 : 0xf4); // "t:" vs. "h:"
+          gau8Tm1637Data[TM1637_COLON_POS] = (bTemp ? SEG7_t : SEG7_h) | 0x80;
         } else {
           StatStore *psX = bTemp ? &gsTemp : &gsRhum;
           int16_t i16Val = bMax ? psX->ai16MaxDat[1] : psX->ai16MinDat[1];
@@ -300,28 +347,27 @@ static void _display_cycle(uint64_t u64tckNow) {
           _asciiseq_to_seg7(gau8Tm1637Data, acDispData, 4);
         }
         ++geDisplayMMState;
-        if (geDisplayMMState == TM1637MM_NIL)
-          geDisplayMajorState = TM1637_REGULAR;
+        if (geDisplayMMState == DISPLAY_MM_NIL)
+          geDisplayMajorState = DISPLAY_REGULAR;
         break;
-      case TM1637_REGULAR:
+      case DISPLAY_REGULAR:
       {
-        bool bTemp = (eRegState == TM1637REG_TEMP);
+        bool bTemp = (eRegState == DISPLAY_REGULAR_TEMP);
         int16_t i16Value = bTemp ? gai16TempStoreMin[gu8StoreMinIdx] : gai16RhumStoreMin[gu8StoreMinIdx];
         _i16_to_asciiseq(acDispData, i16Value, bTemp);
         _asciiseq_to_seg7(gau8Tm1637Data, acDispData, 4);
-        eRegState = (eRegState == TM1637REG_TEMP) ? TM1637REG_HUM : TM1637REG_TEMP;
+        eRegState = (eRegState == DISPLAY_REGULAR_TEMP) ? DISPLAY_REGULAR_RHUM : DISPLAY_REGULAR_TEMP;
       }
 
         break;
     }
-    gsReadyData.u64tckStart = timg_ticks(gsTimer);
     if (gbTm1637FullFlushRequired) {
       tm1637_flush_full(&gsTm1637State, TM1637_CELLS);
       gbTm1637FullFlushRequired = false;
     } else {
       tm1637_flush_range(&gsTm1637State, 0, TM1637_CELLS);
     }
-    u64NextTick += MS2TICKS(geDisplayMajorState == TM1637_INIT ? 200 : DISPLAY_PERIOD_MS);
+    u64NextTick += MS2TICKS(geDisplayMajorState == DISPLAY_INIT ? DISPLAY_INITPERIOD_MS : DISPLAY_PERIOD_MS);
   }
 }
 
@@ -329,9 +375,8 @@ static void _display_init() {
   STm1637Iface sIface = { TM1637CLK_GPIO, TM1637DIO_GPIO, TM1637CLK_RMTCH, TM1637DIO_RMTCH};
   gsTm1637State = tm1637_config(&sIface, gau8Tm1637Data);
   tm1637_init(&gsTm1637State, APB_FREQ_HZ);
-  tm1637_set_readycb(&gsTm1637State, _display_ready, &gsReadyData);
-  tm1637_set_brightness(&gsTm1637State, true, 7);
-  gsReadyData.psState = &gsTm1637State;
+  tm1637_set_readycb(&gsTm1637State, _display_ready, NULL);
+  tm1637_set_brightness(&gsTm1637State, true, DISPLAY_BRIGHTNESS_INIT);
 }
 
 /**
@@ -526,7 +571,7 @@ static void _measproc_cycle(uint64_t u64tckNow) {
   }
 }
 
-void _dht22_run_ready_cb(void *pvParam, SDht22Data *psParam) {
+void _dht22_run_ready_cb(void *pvParam, SDht22Data * psParam) {
   gbDht22ResultReady = true;
   gpio_pin_out_off(LED1_GPIO);
 
@@ -545,7 +590,7 @@ static void _dht22_cycle(uint64_t u64Ticks) {
     gpio_pin_out_on(LED1_GPIO);
     dht22_run(&gsDht22Desc);
 
-    u64NextTick += MS2TICKS(RMTDHT_PERIOD_MS);
+    u64NextTick += MS2TICKS(DHT22_PERIOD_MS);
   }
 }
 
@@ -577,6 +622,7 @@ void prog_cycle_app(uint64_t u64tckNow) {
 }
 
 void prog_cycle_pro(uint64_t u64tckNow) {
+  _button_cycle(u64tckNow);
   _measproc_cycle(u64tckNow);
   _measlog_cycle(u64tckNow);
   _alive_blink_cycle(u64tckNow);
