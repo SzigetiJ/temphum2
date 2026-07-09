@@ -32,7 +32,8 @@
 #define DHT22_PERIOD_MS       2000U
 #define DISPLAY_INITDELAY_MS   100U
 #define DISPLAY_INITPERIOD_MS  200U
-#define DISPLAY_PERIOD_MS     1000U
+#define DISPLAY_DELAY_MS        20U // DHT22 requires ~5ms to do the measurement (with interrupt, callback etc.). After 20 µs the data is certainly ready.
+#define DISPLAY_PERIOD_MS     1000U // We need 2 display periods to show temp and rhum data. Note, 2*DISPLAY_PERIOD_MS == DHT22_PERIOD_MS
 #define UART_FREQ_HZ        115200U
 #define ALIVE_BLINK_PERIOD_MS 5000U
 #define ALIVE_BLINK_ON_MS       50U
@@ -84,9 +85,11 @@ typedef enum {
 typedef enum {
   DISPLAY_MM_ANNOUNCETEMP = 0,
   DISPLAY_MM_TEMPMIN,
+  DISPLAY_MM_TEMPGAP,
   DISPLAY_MM_TEMPMAX,
   DISPLAY_MM_ANNOUNCERHUM,
   DISPLAY_MM_RHUMMIN,
+  DISPLAY_MM_RHUMGAP,
   DISPLAY_MM_RHUMMAX,
   DISPLAY_MM_NIL
 } E_DISPLAY_MINMAX_STATE;
@@ -216,6 +219,7 @@ const uint32_t gau32msAliveBlinkPeriod[] = {
   10000
 };
 static uint8_t gu8AliveBlinkPeriodIdx = 3;
+static uint64_t gu64tckAliveNextOn = 0;
 
 // button data
 DRAM_ATTR static SButtonDebounceFlags gsButtonFlags;
@@ -237,6 +241,7 @@ static bool gbTm1637FullFlushRequired = true;
 static STm1637State gsTm1637State;
 
 // what is displayed - states
+static bool gbDisplayIrregularUpdate = false;
 static E_DISPLAY_MAJOR_STATE geDisplayMajorState = DISPLAY_INIT;
 static E_DISPLAY_MINMAX_STATE geDisplayMMState;
 
@@ -304,12 +309,19 @@ static void _alive_blink_init() {
 }
 
 static void _alive_blink_cycle(uint64_t u64tckNow) {
-  static uint64_t u64tckNext = 0;
-  static bool bState = false;
-  if (u64tckNext <= u64tckNow) {
-    bState = !bState;
-    gpio_reg_setbit(bState ? &gsGPIO.OUT_W1TS : &gsGPIO.OUT_W1TC, LED0_GPIO);
-    u64tckNext += MS2TICKS(bState ? ALIVE_BLINK_ON_MS : (gau32msAliveBlinkPeriod[gu8AliveBlinkPeriodIdx] - ALIVE_BLINK_ON_MS));
+  static uint64_t u64tckNextOff = 0;
+  static bool bOn = false;
+
+  if (bOn && u64tckNextOff <= u64tckNow) {
+    gpio_pin_out_off(LED0_GPIO);
+    bOn = false;
+  }
+
+  if (gu64tckAliveNextOn <= u64tckNow) {
+    gu64tckAliveNextOn += MS2TICKS(gau32msAliveBlinkPeriod[gu8AliveBlinkPeriodIdx]);
+    gpio_pin_out_on(LED0_GPIO);
+    bOn = true;
+    u64tckNextOff = u64tckNow + MS2TICKS(ALIVE_BLINK_ON_MS);
   }
 }
 
@@ -445,6 +457,7 @@ static void _button_cycle(uint64_t u64tckNow) {
 static void _button0off(void *pvParam) {
   geDisplayMMState = DISPLAY_MM_ANNOUNCETEMP;
   geDisplayMajorState = DISPLAY_MINMAX;
+  gbDisplayIrregularUpdate = true;
 }
 
 static void _button0offlong(void *pvParam) {
@@ -457,6 +470,7 @@ static void _button2off(void *pvParam) {
   gsTm1637State.u8Brightness = 0x08 | u8Next;
   gbTm1637FullFlushRequired = true;
   uart_printf(&gsUART0, "Display brightness: %u\r\n", u8Next);
+  gbDisplayIrregularUpdate = true;
 }
 
 static void _button2offlong(void *pvParam) {
@@ -467,11 +481,17 @@ static void _button_updown_on(void *pvParam) {
   int32_t *pi32Param = (int32_t*) pvParam;
   if (*pi32Param < 0) {
     if (0 < gu8AliveBlinkPeriodIdx) {
+      uint32_t u32PeriodOrig = gau32msAliveBlinkPeriod[gu8AliveBlinkPeriodIdx];
       --gu8AliveBlinkPeriodIdx;
+      uint32_t u32PeriodCurr = gau32msAliveBlinkPeriod[gu8AliveBlinkPeriodIdx];
+      gu64tckAliveNextOn -= MS2TICKS(u32PeriodOrig - u32PeriodCurr);
     }
   } else {
     if (gu8AliveBlinkPeriodIdx < ARRAY_SIZE(gau32msAliveBlinkPeriod) - 1) {
+      uint32_t u32PeriodOrig = gau32msAliveBlinkPeriod[gu8AliveBlinkPeriodIdx];
       ++gu8AliveBlinkPeriodIdx;
+      uint32_t u32PeriodCurr = gau32msAliveBlinkPeriod[gu8AliveBlinkPeriodIdx];
+      gu64tckAliveNextOn += MS2TICKS(u32PeriodCurr - u32PeriodOrig);
     }
   }
   uart_printf(&gsUART0, "up/down: %d, blink period: %u (#%u)\r\n", *pi32Param, gau32msAliveBlinkPeriod[gu8AliveBlinkPeriodIdx], gu8AliveBlinkPeriodIdx);
@@ -485,12 +505,27 @@ IRAM_ATTR static void _display_ready(void *pvParam) {
 }
 
 static void _display_cycle(uint64_t u64tckNow) {
-  static uint64_t u64NextTick = MS2TICKS(DISPLAY_INITDELAY_MS);
-  static E_DISPLAY_REGULAR_STATE eRegState = DISPLAY_REGULAR_TEMP;
+  // when to execute active processing
+  static uint64_t u64tckNext = MS2TICKS(DISPLAY_INITDELAY_MS);
+
+  // for regular temp/hum display
+  static uint64_t u64tckMainNext = MS2TICKS(DISPLAY_DELAY_MS);
+  static E_DISPLAY_REGULAR_STATE eRegState = DISPLAY_REGULAR_RHUM;
+
+  // for init phase
   static int8_t i8InitScrollOffset = -3;
+
+  // aux buffer, for storing displayed data az characters
   char acDispData[TM1637_CELLS];
 
-  if (u64NextTick <= u64tckNow) {
+
+  if (u64tckNext <= u64tckNow || gbDisplayIrregularUpdate) {
+    // adjust regular timer and state
+    while (u64tckMainNext < u64tckNow) {
+      u64tckMainNext += MS2TICKS(DISPLAY_PERIOD_MS);
+      eRegState = (eRegState + 1) & 1;
+    }
+
     switch (geDisplayMajorState) {
       case DISPLAY_INIT: // scroll nums right to left
         for (int i = 0; i < TM1637_CELLS; ++i) {
@@ -506,12 +541,15 @@ static void _display_cycle(uint64_t u64tckNow) {
         if (geDisplayMMState == DISPLAY_MM_TEMPMIN) {
           gbTm1637FullFlushRequired = true;
         }
-        bool bAnnounce = (geDisplayMMState % 3 == 0);
-        bool bTemp = (geDisplayMMState < 3);
-        bool bMax = (geDisplayMMState % 3 == 2);
+        bool bAnnounce = (geDisplayMMState % 4 == 0);
+        bool bTemp = (geDisplayMMState < 4);
+        bool bGap = (geDisplayMMState % 4 == 2);
+        bool bMax = (geDisplayMMState % 4 == 3);
         if (bAnnounce) {
           for (int i = 0; i < TM1637_CELLS; ++i) gau8Tm1637Data[i] = 0;
           gau8Tm1637Data[TM1637_COLON_POS] = (bTemp ? SEG7_t : SEG7_h) | 0x80;
+        } else if (bGap) {
+          *(uint32_t*)gau8Tm1637Data = 0x80808080;
         } else {
           StatStore *psX = bTemp ? &gsTemp : &gsRhum;
           int16_t i16Val = bMax ? psX->ai16MaxDat[1] : psX->ai16MinDat[1];
@@ -531,7 +569,6 @@ static void _display_cycle(uint64_t u64tckNow) {
         int16_t i16Value = bTemp ? gai16TempStoreMin[gu8StoreMinIdx] : gai16RhumStoreMin[gu8StoreMinIdx];
         _i16_to_asciiseq(acDispData, i16Value, bTemp);
         _asciiseq_to_seg7(gau8Tm1637Data, acDispData, 4);
-        eRegState = (eRegState == DISPLAY_REGULAR_TEMP) ? DISPLAY_REGULAR_RHUM : DISPLAY_REGULAR_TEMP;
       }
 
         break;
@@ -542,7 +579,11 @@ static void _display_cycle(uint64_t u64tckNow) {
     } else {
       tm1637_flush_range(&gsTm1637State, 0, TM1637_CELLS);
     }
-    u64NextTick += MS2TICKS(geDisplayMajorState == DISPLAY_INIT ? DISPLAY_INITPERIOD_MS : DISPLAY_PERIOD_MS);
+    u64tckNext =
+            (geDisplayMajorState == DISPLAY_INIT) ? u64tckNow + MS2TICKS(DISPLAY_INITPERIOD_MS) :
+            (geDisplayMajorState == DISPLAY_MINMAX) ? u64tckNow + MS2TICKS(geDisplayMMState & 1 ? DISPLAY_PERIOD_MS / 2 : DISPLAY_PERIOD_MS) :
+            u64tckMainNext;  // REGULAR major state
+    gbDisplayIrregularUpdate = false;
   }
 }
 
@@ -756,7 +797,6 @@ static void _measproc_cycle(uint64_t u64tckNow) {
 IRAM_ATTR static void _dht22_run_ready_cb(void *pvParam, SDht22Data * psParam) {
   gbDht22ResultReady = true;
   gpio_pin_out_off(LED1_GPIO);
-
 }
 
 static void _dht22_init() {
