@@ -1,4 +1,4 @@
-## Temperature and Humidity
+## Temperature and Humidity II
 
 ![GitHub](https://img.shields.io/github/license/SzigetiJ/temphum2)
 <!--![C/C++ CI](https://github.com/SzigetiJ/temphum2/workflows/C/C++%20CI/badge.svg)-->

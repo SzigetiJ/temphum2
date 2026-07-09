@@ -43,8 +43,9 @@
 #define LED0_GPIO                2U
 #define LED1_GPIO               17U
 #define BUTTON0_GPIO            18U
-#define BUTTON1_GPIO            18U // not connected
 #define BUTTON2_GPIO             0U // onboard button - used for TM1637 brightness cycling
+#define BUTTONUP_GPIO           32U // UP
+#define BUTTONDOWN_GPIO         33U // DOWN
 #define TM1637CLK_GPIO          25U
 #define TM1637DIO_GPIO          26U
 #define DHT22_GPIO              27U
@@ -112,10 +113,19 @@ typedef struct {
   void *pvParam;
 } SButtonActions;
 
+typedef struct {
+  RegAddr prReg;
+  uint8_t u8BitPU;
+  uint8_t u8BitPD;
+  uint8_t u8BitMcuPU;
+  uint8_t u8BitMcuPD;
+} SGpioPUPDBits;
+
 // ================ Local function declarations =================
 static void _alive_blink_init();
 static void _alive_blink_cycle(uint64_t u64tckNow);
 
+static inline void _gpio_set_pullup_pulldown(uint8_t u8Pin, bool bPU, bool bPD, bool bMcuPU, bool bMcuPD);
 static inline SGpioPinReg _gpio_pinreg(uint32_t u1PadDriver, uint32_t u3PinIntType, uint32_t u1WakeUpEn, uint32_t u5PinIntEn);
 static inline IomuxGpioConfReg _iomux_gpioconfreg(uint32_t u3McuSel, uint32_t u2FunDrv, uint32_t u1FunIE,
         uint32_t u2FunWPUD, uint32_t u2McuDrv, uint32_t u1McuIE, uint32_t u2McuWPUD, uint32_t u1SlpSel, uint32_t u1McuOE);
@@ -127,6 +137,7 @@ static void _button0off(void *pvParam);
 static void _button0offlong(void *pvParam);
 static void _button2off(void *pvParam);
 static void _button2offlong(void *pvParam);
+static void _button_updown_on(void *pvParam);
 
 static void _display_init();
 static void _display_cycle(uint64_t u64tckNow);
@@ -150,12 +161,71 @@ const uint16_t gu16Tim00Divisor = TIM0_0_DIVISOR;
 const uint64_t gu64tckSchedulePeriod = (CLK_FREQ_HZ / SCHEDULE_FREQ_HZ);
 
 // ==================== Local Data ================
+const RegAddr gprRTCIOXTAL = (RegAddr)0x3FF4848C;
+const RegAddr gprRTCIO = (RegAddr)0x3FF48494;
+const SGpioPUPDBits gasGPIOPUPDBits[] = {
+  // GPIO 0
+  {&grIOMUX + gau8IomuxGpioIdx[0], 8, 7, 3, 2},
+  {&grIOMUX + gau8IomuxGpioIdx[1], 8, 7, 3, 2},
+  {&grIOMUX + gau8IomuxGpioIdx[2], 8, 7, 3, 2},
+  {&grIOMUX + gau8IomuxGpioIdx[3], 8, 7, 3, 2},
+  {&grIOMUX + gau8IomuxGpioIdx[4], 8, 7, 3, 2},
+  {&grIOMUX + gau8IomuxGpioIdx[5], 8, 7, 3, 2},
+  {&grIOMUX + gau8IomuxGpioIdx[6], 8, 7, 3, 2},
+  {&grIOMUX + gau8IomuxGpioIdx[7], 8, 7, 3, 2},
+  {&grIOMUX + gau8IomuxGpioIdx[8], 8, 7, 3, 2},
+  {&grIOMUX + gau8IomuxGpioIdx[9], 8, 7, 3, 2},
+  {&grIOMUX + gau8IomuxGpioIdx[10], 8, 7, 3, 2},
+  {&grIOMUX + gau8IomuxGpioIdx[11], 8, 7, 3, 2},
+  {&grIOMUX + gau8IomuxGpioIdx[12], 8, 7, 3, 2},
+  {&grIOMUX + gau8IomuxGpioIdx[13], 8, 7, 3, 2},
+  {&grIOMUX + gau8IomuxGpioIdx[14], 8, 7, 3, 2},
+  {&grIOMUX + gau8IomuxGpioIdx[15], 8, 7, 3, 2},
+  {&grIOMUX + gau8IomuxGpioIdx[16], 8, 7, 3, 2},
+  {&grIOMUX + gau8IomuxGpioIdx[17], 8, 7, 3, 2},
+  {&grIOMUX + gau8IomuxGpioIdx[18], 8, 7, 3, 2},
+  {&grIOMUX + gau8IomuxGpioIdx[19], 8, 7, 3, 2},
+  {&grIOMUX + gau8IomuxGpioIdx[20], 8, 7, 3, 2},
+  {&grIOMUX + gau8IomuxGpioIdx[21], 8, 7, 3, 2},
+  {&grIOMUX + gau8IomuxGpioIdx[22], 8, 7, 3, 2},
+  {&grIOMUX + gau8IomuxGpioIdx[23], 8, 7, 3, 2},
+  {&grIOMUX + gau8IomuxGpioIdx[24], 8, 7, 3, 2},
+  {&grIOMUX + gau8IomuxGpioIdx[25], 8, 7, 3, 2},
+  {&grIOMUX + gau8IomuxGpioIdx[26], 8, 7, 3, 2},
+  {&grIOMUX + gau8IomuxGpioIdx[27], 8, 7, 3, 2},
+  {&grIOMUX + gau8IomuxGpioIdx[28], 8, 7, 3, 2},
+  {&grIOMUX + gau8IomuxGpioIdx[29], 8, 7, 3, 2},
+  {&grIOMUX + gau8IomuxGpioIdx[30], 8, 7, 3, 2},
+  {&grIOMUX + gau8IomuxGpioIdx[31], 8, 7, 3, 2},
+  {gprRTCIOXTAL, 22, 23, 22, 23},
+  {gprRTCIOXTAL, 27, 28, 27, 28},
+  {&grIOMUX + gau8IomuxGpioIdx[34], 8, 7, 3, 2},
+  {&grIOMUX + gau8IomuxGpioIdx[35], 8, 7, 3, 2},
+  {&grIOMUX + gau8IomuxGpioIdx[36], 8, 7, 3, 2},
+  {&grIOMUX + gau8IomuxGpioIdx[37], 8, 7, 3, 2},
+  {&grIOMUX + gau8IomuxGpioIdx[38], 8, 7, 3, 2},
+  {&grIOMUX + gau8IomuxGpioIdx[39], 8, 7, 3, 2}
+};
+
+// alive blinking (toy)
+const uint32_t gau32msAliveBlinkPeriod[] = {
+  500,
+  1000,
+  2000,
+  5000,
+  10000
+};
+static uint8_t gu8AliveBlinkPeriodIdx = 3;
 
 // button data
 DRAM_ATTR static SButtonDebounceFlags gsButtonFlags;
+const int32_t gi32Up = 1;
+const int32_t gi32Down = -1;
 const SButtonActions gasButtonActions[] = {
   {BUTTON0_GPIO, MS2TICKS(1000), NULL, _button0off, _button0offlong, NULL},
-  {BUTTON2_GPIO, MS2TICKS(1000), NULL, _button2off, _button2offlong, NULL}
+  {BUTTON2_GPIO, MS2TICKS(1000), NULL, _button2off, _button2offlong, NULL},
+  {BUTTONUP_GPIO, MS2TICKS(1000), _button_updown_on, NULL, NULL, (void*)&gi32Up},
+  {BUTTONDOWN_GPIO, MS2TICKS(1000), _button_updown_on, NULL, NULL, (void*)&gi32Down}
 };
 static SButtonState gasButtonState[ARRAY_SIZE(gasButtonActions)];
 
@@ -200,6 +270,22 @@ static bool gbDebugDHT22 = false;
 // ============== Implementation ==============
 // -------------- Internal functions --------------
 
+static inline void _gpio_set_pullup_pulldown(uint8_t u8Pin, bool bPU, bool bPD, bool bMcuPU, bool bMcuPD) {
+  const SGpioPUPDBits *psItem = &gasGPIOPUPDBits[u8Pin];
+  uint32_t u32MaskSet = (bPU ? 1 << psItem->u8BitPU : 0) |
+          (bPD ? 1 << psItem->u8BitPD : 0) |
+          (bMcuPU ? 1 << psItem->u8BitMcuPU : 0) |
+          (bMcuPD ? 1 << psItem->u8BitMcuPD : 0);
+  uint32_t u32MaskClr = (!bPU ? 1 << psItem->u8BitPU : 0) |
+          (!bPD ? 1 << psItem->u8BitPD : 0) |
+          (!bMcuPU ? 1 << psItem->u8BitMcuPU : 0) |
+          (!bMcuPD ? 1 << psItem->u8BitMcuPD : 0);
+  Reg rDat = *psItem->prReg;
+  rDat |= u32MaskSet;
+  rDat &= ~u32MaskClr;
+  *psItem->prReg = rDat;
+}
+
 static inline SGpioPinReg _gpio_pinreg(uint32_t u1PadDriver, uint32_t u3PinIntType, uint32_t u1WakeUpEn, uint32_t u5PinIntEn) {
   return (SGpioPinReg)((u1PadDriver << 2) | (u3PinIntType << 7) | (u1WakeUpEn << 10) | (u5PinIntEn << 13));
 }
@@ -223,7 +309,7 @@ static void _alive_blink_cycle(uint64_t u64tckNow) {
   if (u64tckNext <= u64tckNow) {
     bState = !bState;
     gpio_reg_setbit(bState ? &gsGPIO.OUT_W1TS : &gsGPIO.OUT_W1TC, LED0_GPIO);
-    u64tckNext += MS2TICKS(bState ? ALIVE_BLINK_ON_MS : (ALIVE_BLINK_PERIOD_MS - ALIVE_BLINK_ON_MS));
+    u64tckNext += MS2TICKS(bState ? ALIVE_BLINK_ON_MS : (gau32msAliveBlinkPeriod[gu8AliveBlinkPeriodIdx] - ALIVE_BLINK_ON_MS));
   }
 }
 
@@ -234,7 +320,7 @@ IRAM_ATTR static void _button_isr(void *pvParam) {
   gsButtonFlags.abDirty |= gsGPIO.STATUS;
   gsButtonFlags.abDirty1 |= gsGPIO.STATUS1 & 0xFF;
   gsGPIO.STATUS_W1TC = -1;
-  gsGPIO.STATUS1_W1TC = -1;
+  gsGPIO.STATUS1_W1TC = 0xFF;
   gsUART0.FIFO = '%';
 }
 
@@ -244,6 +330,7 @@ static void _configure_button(uint8_t u8Gpio) {
 
   iomux_set_gpioconf(u8Gpio, rIOMuxX);
   gsGPIO.PIN[u8Gpio] = rGpioPinN;
+  _gpio_set_pullup_pulldown(u8Gpio, 1, 0, 1, 0);
   gsGPIO.FUNC_OUT_SEL_CFG[u8Gpio] = (1 << 10) | 256;
   gpio_pin_disable(u8Gpio);
   gpio_reg_setbit(&gsGPIO.STATUS_W1TC, u8Gpio);
@@ -251,13 +338,18 @@ static void _configure_button(uint8_t u8Gpio) {
 
 static void _button_init() {
   // setup iomux & gpio regs
-  _configure_button(BUTTON0_GPIO);
-  _configure_button(BUTTON2_GPIO);
+  for (int i = 0; i < ARRAY_SIZE(gasButtonActions); ++i) {
+    _configure_button(gasButtonActions[i].u8Gpio);
+  }
+
+  // init sw states
   for (int i = 0; i < ARRAY_SIZE(gasButtonActions); ++i) {
     gasButtonState[i].u64tckLastInt = 0;
     gasButtonState[i].u64tckPress = 0;
     gasButtonState[i].u8LastKnownState = 1; // high
   }
+
+  // isr-related flags
   gsButtonFlags.abDirty = 0U;
   gsButtonFlags.abDirty1 = 0U;
   gsButtonFlags.abChallenge = 0U;
@@ -369,6 +461,20 @@ static void _button2off(void *pvParam) {
 
 static void _button2offlong(void *pvParam) {
   gbMeasLog = true;
+}
+
+static void _button_updown_on(void *pvParam) {
+  int32_t *pi32Param = (int32_t*) pvParam;
+  if (*pi32Param < 0) {
+    if (0 < gu8AliveBlinkPeriodIdx) {
+      --gu8AliveBlinkPeriodIdx;
+    }
+  } else {
+    if (gu8AliveBlinkPeriodIdx < ARRAY_SIZE(gau32msAliveBlinkPeriod) - 1) {
+      ++gu8AliveBlinkPeriodIdx;
+    }
+  }
+  uart_printf(&gsUART0, "up/down: %d, blink period: %u (#%u)\r\n", *pi32Param, gau32msAliveBlinkPeriod[gu8AliveBlinkPeriodIdx], gu8AliveBlinkPeriodIdx);
 }
 
 ///////////////////////////
