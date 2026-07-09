@@ -29,7 +29,7 @@ if test ! "x$E32BDIR" = "x"; then
                         AC_MSG_RESULT([Using user-specified esp32basic directory: $E32BDIR])
 
                         dnl Add the include directory to E32B_CPPFLAGS
-                        E32B_CPPFLAGS="-I$E32BDIR/include"
+                        E32B_CPPFLAGS="-I$E32BDIR/include -I$E32BDIR/include/modules"
                         E32B_LDFLAGS="-L$E32BDIR/lib"
                 else
                         AC_MSG_ERROR([the --with-e32bdir directory "$E32BDIR" cannot be found])
