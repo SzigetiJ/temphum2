@@ -29,6 +29,8 @@
 // =================== Hard constants =================
 // #1: Timings
 #define BUTTONCHECK_PERIOD_MS   10U
+#define BUTTON_LONGHOLD_DELAY_MS 2000U
+#define BUTTON_LONGHOLD_REPEAT_MS 500U
 #define DHT22_PERIOD_MS       2000U
 #define DISPLAY_INITDELAY_MS   100U
 #define DISPLAY_INITPERIOD_MS  200U
@@ -104,15 +106,18 @@ typedef struct {
 typedef struct {
   uint64_t u64tckPress;
   uint64_t u64tckLastInt;
+  uint64_t u64tckNextLongHoldEvent;
+  uint32_t u32RepCnt;
   uint8_t u8LastKnownState;
 } SButtonState;
 
 typedef struct {
   uint8_t u8Gpio;
-  uint64_t u64tckLongPress;
+  uint64_t u64tckLongPressDelay;
+  uint64_t u64tckLongPressRepeat;
   void (*fPress)(void *pvParam);
   void (*fShortRelease)(void *pvParam);
-  void (*fLongRelease)(void *pvParam);
+  void (*fLongHold)(uint32_t u32RepCnt, void *pvParam);
   void *pvParam;
 } SButtonActions;
 
@@ -137,9 +142,9 @@ static void _button_init();
 static void _button_cycle(uint64_t u64tckNow);
 static void _button_isr(void *pvParam);
 static void _button0off(void *pvParam);
-static void _button0offlong(void *pvParam);
+static void _button0long(uint32_t u32RepCnt, void *pvParam);
 static void _button2off(void *pvParam);
-static void _button2offlong(void *pvParam);
+static void _button2long(uint32_t u32RepCnt, void *pvParam);
 static void _button_updown_on(void *pvParam);
 
 static void _display_init();
@@ -226,10 +231,10 @@ DRAM_ATTR static SButtonDebounceFlags gsButtonFlags;
 const int32_t gi32Up = 1;
 const int32_t gi32Down = -1;
 const SButtonActions gasButtonActions[] = {
-  {BUTTON0_GPIO, MS2TICKS(1000), NULL, _button0off, _button0offlong, NULL},
-  {BUTTON2_GPIO, MS2TICKS(1000), NULL, _button2off, _button2offlong, NULL},
-  {BUTTONUP_GPIO, MS2TICKS(1000), _button_updown_on, NULL, NULL, (void*)&gi32Up},
-  {BUTTONDOWN_GPIO, MS2TICKS(1000), _button_updown_on, NULL, NULL, (void*)&gi32Down}
+  {BUTTON0_GPIO, MS2TICKS(BUTTON_LONGHOLD_DELAY_MS), MS2TICKS(BUTTON_LONGHOLD_REPEAT_MS), NULL, _button0off, _button0long, NULL},
+  {BUTTON2_GPIO, MS2TICKS(BUTTON_LONGHOLD_DELAY_MS), MS2TICKS(BUTTON_LONGHOLD_REPEAT_MS), NULL, _button2off, _button2long, NULL},
+  {BUTTONUP_GPIO, MS2TICKS(BUTTON_LONGHOLD_DELAY_MS), MS2TICKS(BUTTON_LONGHOLD_REPEAT_MS), _button_updown_on, NULL, NULL, (void*)&gi32Up},
+  {BUTTONDOWN_GPIO, MS2TICKS(BUTTON_LONGHOLD_DELAY_MS), MS2TICKS(BUTTON_LONGHOLD_REPEAT_MS), _button_updown_on, NULL, NULL, (void*)&gi32Down}
 };
 static SButtonState gasButtonState[ARRAY_SIZE(gasButtonActions)];
 
@@ -376,8 +381,21 @@ static void _button_init() {
   ets_isr_unmask(1 << BUTTONINT_CH);
 }
 
+static uint64_t _button_next_long_hold() {
+  uint64_t u64tckNextLongHold = -1;
+  for (int i = 0; i < ARRAY_SIZE(gasButtonActions); ++i) {
+    if ((gasButtonState[i].u8LastKnownState == 0) && (gasButtonState[i].u64tckNextLongHoldEvent < u64tckNextLongHold)) {
+      u64tckNextLongHold = gasButtonState[i].u64tckNextLongHoldEvent;
+    }
+  }
+  uart_printf(&gsUART0, "Next longhold event @%u ms\r\n", TICKS2MS(u64tckNextLongHold));
+  return u64tckNextLongHold;
+}
+
 static void _button_cycle(uint64_t u64tckNow) {
   static uint64_t u64tckNext = 0;
+  static bool bLongHold = false;
+  static uint64_t u64tckNextLongHold = -1;
   static uint32_t u32ChallengeCycles = 0; // debug variable
 
   if (u64tckNext <= u64tckNow) {
@@ -404,6 +422,7 @@ static void _button_cycle(uint64_t u64tckNow) {
 
     // challenge changes after a while
     if (gsButtonFlags.abChallenge || gsButtonFlags.abChallenge1) {
+      bool bAnyPressed = false;
       ++u32ChallengeCycles;
       for (int i = 0; i < ARRAY_SIZE(gasButtonState); ++i) {
         uint8_t u8Byte = gasButtonActions[i].u8Gpio >> 5;
@@ -418,19 +437,19 @@ static void _button_cycle(uint64_t u64tckNow) {
           if (bLevel != gasButtonState[i].u8LastKnownState) {  // significant change!
             gasButtonState[i].u8LastKnownState = bLevel;
 
-            uart_printf(&gsUART0, "Button#%u %s", gasButtonActions[i].u8Gpio, bLevel ? "released" : "pressed");
+            uart_printf(&gsUART0, "Button#%u @%u ms %s\r\n", gasButtonActions[i].u8Gpio, (uint32_t)(TICKS2MS(u64tckNow)), bLevel ? "released" : "pressed");
             if (bLevel == 0) {  // pressed
               gasButtonState[i].u64tckPress = u64tckNow;
+              gasButtonState[i].u64tckNextLongHoldEvent = u64tckNow + gasButtonActions[i].u64tckLongPressDelay;
+              gasButtonState[i].u32RepCnt = 0;
+              bAnyPressed = true;
               if (gasButtonActions[i].fPress != NULL) {
                 gasButtonActions[i].fPress(gasButtonActions[i].pvParam);
               }
             } else {  // release
               uint64_t u64tckPressDuration = u64tckNow - gasButtonState[i].u64tckPress;
-              if (gasButtonActions[i].u64tckLongPress <= u64tckPressDuration) { // long press
-                uart_printf(&gsUART0, " (long)");
-                if (gasButtonActions[i].fLongRelease != NULL) {
-                  gasButtonActions[i].fLongRelease(gasButtonActions[i].pvParam);
-                }
+              if (gasButtonActions[i].u64tckLongPressDelay <= u64tckPressDuration) { // long press
+                // nothing to do when long hold gets released
               } else {  // short press
                 if (gasButtonActions[i].fShortRelease != NULL) {
                   gasButtonActions[i].fShortRelease(gasButtonActions[i].pvParam);
@@ -440,12 +459,34 @@ static void _button_cycle(uint64_t u64tckNow) {
             // debug
             uart_printf(&gsUART0, " %u %02X %08X\r\n", u32ChallengeCycles, gsButtonFlags.abChallenge1, gsButtonFlags.abChallenge);
           } else {  // only one or more spikes
-
           }
         }
       }
-
+      if (bAnyPressed) {
+        u64tckNextLongHold = _button_next_long_hold();
+        bLongHold = true;
+      }
     }
+
+    // process Long Holds
+    if (bLongHold && (u64tckNextLongHold <= u64tckNow)) {
+      bLongHold = false;
+      // find which button has longhold event (and is still pressed)
+      for (int i = 0; i < ARRAY_SIZE(gasButtonActions); ++i) {
+        if ((gasButtonState[i].u8LastKnownState == 0) && (gasButtonState[i].u64tckNextLongHoldEvent <= u64tckNow)) {
+          if (gasButtonActions[i].fLongHold != NULL) {
+            gasButtonActions[i].fLongHold(gasButtonState[i].u32RepCnt, gasButtonActions[i].pvParam);
+          }
+          ++gasButtonState[i].u32RepCnt;
+          gasButtonState[i].u64tckNextLongHoldEvent += gasButtonActions[i].u64tckLongPressRepeat;
+          bLongHold = true;
+        }
+      }
+      if (bLongHold) {  // update next timer
+        u64tckNextLongHold = _button_next_long_hold();
+      }
+    }
+
     // enable GPIO interrupt
     gsGPIO.ENABLE = u32IntEn;
     gsGPIO.ENABLE1 = u32IntEn1;
@@ -460,8 +501,8 @@ static void _button0off(void *pvParam) {
   gbDisplayIrregularUpdate = true;
 }
 
-static void _button0offlong(void *pvParam) {
-  uart_printf(&gsUART0, "Entering config...\r\n");
+static void _button0long(uint32_t u32RepCnt, void *pvParam) {
+  uart_printf(&gsUART0, "Entering config #%u...\r\n", u32RepCnt);
 }
 
 static void _button2off(void *pvParam) {
@@ -473,7 +514,7 @@ static void _button2off(void *pvParam) {
   gbDisplayIrregularUpdate = true;
 }
 
-static void _button2offlong(void *pvParam) {
+static void _button2long(uint32_t u32RepCnt, void *pvParam) {
   gbMeasLog = true;
 }
 
