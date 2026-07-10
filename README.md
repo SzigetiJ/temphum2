@@ -85,8 +85,8 @@ Build is started by command
 ```
 within `dist/perf`. If everything goes well, it produces `src/temphum.bin` relative to `dist/perf`.
 
-If your ESP32 is bound with UART adapter, e.g., CP2102, like in NodeMCU-ESP32S, installation is simple.
-To install (i.e., write the binary to the ESP32 board) via UART, you can use `scripts/flash.sh`:
+If your ESP32 is bound with UART &harr; USB adapter, e.g., CP2102, like in NodeMCU-ESP32S, installation is simple via USB port.
+To install (i.e., write the binary to the ESP32 board) via USB, you can use `scripts/flash.sh`:
 ```
  ../../scripts/flash.sh src/temphum.bin
 ```
