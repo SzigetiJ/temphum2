@@ -34,6 +34,8 @@
 #define DHT22_PERIOD_MS       2000U
 #define DISPLAY_INITDELAY_MS   100U
 #define DISPLAY_INITPERIOD_MS  200U
+#define DISPLAY_INIT2PERIOD_MS  50U // 20 FPS
+#define DISPLAY_INIT2_FRAMES    64U // 50 * 64 = 3200ms
 #define DISPLAY_DELAY_MS        20U // DHT22 requires ~5ms to do the measurement (with interrupt, callback etc.). After 20 µs the data is certainly ready.
 #define DISPLAY_PERIOD_MS     1000U // We need 2 display periods to show temp and rhum data. Note, 2*DISPLAY_PERIOD_MS == DHT22_PERIOD_MS
 #define UART_FREQ_HZ        115200U
@@ -69,12 +71,15 @@
 #define RHUMSTORE_BASE 500
 #define SEG7_t 0x78
 #define SEG7_h 0x74
-
+#define SEG7_H 0x76
+#define SEG7_L 0x38
+#define INIT2_SEGS (SEG7_H << 0 | gau8NumToSeg[0xE] << 8 | SEG7_L << 16 | gau8NumToSeg[0] << 24)
 
 // ============= Local types ===============
 
 typedef enum {
   DISPLAY_INIT = 0,
+  DISPLAY_INIT2,
   DISPLAY_REGULAR,
   DISPLAY_MINMAX
 } E_DISPLAY_MAJOR_STATE;
@@ -555,6 +560,7 @@ static void _display_cycle(uint64_t u64tckNow) {
 
   // for init phase
   static int8_t i8InitScrollOffset = -3;
+  static uint8_t u8Init2FrameIdx = 0;
 
   // aux buffer, for storing displayed data az characters
   char acDispData[TM1637_CELLS];
@@ -575,6 +581,18 @@ static void _display_cycle(uint64_t u64tckNow) {
         }
         ++i8InitScrollOffset;
         if (18 < i8InitScrollOffset) {
+          geDisplayMajorState = DISPLAY_INIT2;
+        }
+        break;
+      case DISPLAY_INIT2: // display message
+        *(uint32_t*)gau8Tm1637Data = INIT2_SEGS;
+        uint8_t u8BrightCharIdx = u8Init2FrameIdx / (DISPLAY_INIT2_FRAMES / 4);
+        if ((u8Init2FrameIdx & 3) == 0) {  // every 2nd frame clr not bright characters
+          uint32_t u32Mask = 0xFF << (8 * (u8BrightCharIdx));
+          *(uint32_t*)gau8Tm1637Data &= u32Mask;
+        }
+        ++u8Init2FrameIdx;
+        if (u8Init2FrameIdx == DISPLAY_INIT2_FRAMES) {
           geDisplayMajorState = DISPLAY_REGULAR;
         }
         break;
@@ -622,6 +640,7 @@ static void _display_cycle(uint64_t u64tckNow) {
     }
     u64tckNext =
             (geDisplayMajorState == DISPLAY_INIT) ? u64tckNow + MS2TICKS(DISPLAY_INITPERIOD_MS) :
+            (geDisplayMajorState == DISPLAY_INIT2) ? u64tckNow + MS2TICKS(DISPLAY_INIT2PERIOD_MS) :
             (geDisplayMajorState == DISPLAY_MINMAX) ? u64tckNow + MS2TICKS(geDisplayMMState & 1 ? DISPLAY_PERIOD_MS / 2 : DISPLAY_PERIOD_MS) :
             u64tckMainNext;  // REGULAR major state
     gbDisplayIrregularUpdate = false;
