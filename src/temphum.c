@@ -31,6 +31,7 @@
 #define BUTTONCHECK_PERIOD_MS   10U
 #define BUTTON_LONGHOLD_DELAY_MS 2000U
 #define BUTTON_LONGHOLD_REPEAT_MS 500U
+#define BUTTON_TRANSIENT_MUL_MAX 4U // max. number of transients per significant change we consider as healthy
 #define DHT22_PERIOD_MS       2000U
 #define DISPLAY_INITDELAY_MS   100U
 #define DISPLAY_INITPERIOD_MS  200U
@@ -135,6 +136,7 @@ typedef struct {
 } SGpioPUPDBits;
 
 // ================ Local function declarations =================
+static bool _alive_dht22();
 static void _alive_blink_init();
 static void _alive_blink_cycle(uint64_t u64tckNow);
 
@@ -243,6 +245,9 @@ const SButtonActions gasButtonActions[] = {
 };
 static SButtonState gasButtonState[ARRAY_SIZE(gasButtonActions)];
 
+static uint32_t gu32ButtonChallengeCycles = 0;  // button cycles with any challenge
+static uint32_t gu32ButtonStateChangedCycles = 0; // button cycles resulted in any button state change
+
 // display data
 const uint8_t gau8NumToSeg[] = {0x3f, 0x06, 0x5b, 0x4f, 0x66, 0x6d, 0x7d, 0x07, 0x7f, 0x6f, 0x77, 0x7c, 0x39, 0x5e, 0x79, 0x71};
 
@@ -314,6 +319,10 @@ static inline IomuxGpioConfReg _iomux_gpioconfreg(uint32_t u3McuSel, uint32_t u2
 ///////////////////////////
 // ALIVE BLINKING section
 
+static bool _alive_dht22() {
+  return !(gsDht22Desc.sData.au8Invalid[4] || *(uint32_t*)gsDht22Desc.sData.au8Invalid);
+}
+
 static void _alive_blink_init() {
   gpio_pin_enable(LED0_GPIO);
 }
@@ -321,13 +330,43 @@ static void _alive_blink_init() {
 static void _alive_blink_cycle(uint64_t u64tckNow) {
   static uint64_t u64tckNextOff = 0;
   static bool bOn = false;
+  static bool bIll = false;
+  static uint32_t u32LastButtonChallenges = 0;
+  static uint32_t u32LastButtonStateChanges = 0;
 
   if (bOn && u64tckNextOff <= u64tckNow) {
-    gpio_pin_out_off(LED0_GPIO);
-    bOn = false;
+    if (!bIll) {
+      gpio_pin_out_off(LED0_GPIO);
+      bOn = false;
+    } else {
+      bool bXon = gpio_pin_read(LED0_GPIO);
+      if (bXon)
+        gpio_pin_out_off(LED0_GPIO);
+      else
+        gpio_pin_out_on(LED0_GPIO);
+      u64tckNextOff += (MS2TICKS(ALIVE_BLINK_ON_MS));
+    }
   }
 
   if (gu64tckAliveNextOn <= u64tckNow) {
+    bIll = false;
+    if (gsTm1637State.abNak) {
+      bIll = true;
+      uart_printf(&gsUART0, "[%u] TM1637 NAKs: %08X\r\n", (uint32_t)TICKS2MS(u64tckNow), gsTm1637State.abNak);
+    }
+    if (!_alive_dht22()) {
+      bIll = true;
+      uart_printf(&gsUART0, "[%u] DHT22 ERRs: %02X%08X\r\n", (uint32_t)TICKS2MS(u64tckNow), gsDht22Desc.sData.au8Invalid[4], *(uint32_t*)gsDht22Desc.sData.au8Invalid);
+    }
+    uint32_t u32BChDiff = gu32ButtonChallengeCycles - u32LastButtonChallenges;
+    uint32_t u32BStCh = gu32ButtonStateChangedCycles - u32LastButtonStateChanges;
+    u32LastButtonChallenges = gu32ButtonChallengeCycles;
+    u32LastButtonStateChanges = gu32ButtonStateChangedCycles;
+
+    if (u32BStCh * BUTTON_TRANSIENT_MUL_MAX < u32BChDiff) {
+      bIll = true;
+      uart_printf(&gsUART0, "Button hazard: %u transient cycles vs. %u cycles with state changes\r\n", u32BChDiff, u32BStCh);
+    }
     gu64tckAliveNextOn += MS2TICKS(gau32msAliveBlinkPeriod[gu8AliveBlinkPeriodIdx]);
     gpio_pin_out_on(LED0_GPIO);
     bOn = true;
@@ -401,7 +440,6 @@ static void _button_cycle(uint64_t u64tckNow) {
   static uint64_t u64tckNext = 0;
   static bool bLongHold = false;
   static uint64_t u64tckNextLongHold = -1;
-  static uint32_t u32ChallengeCycles = 0; // debug variable
 
   if (u64tckNext <= u64tckNow) {
     // disable GPIO interrupt
@@ -427,8 +465,9 @@ static void _button_cycle(uint64_t u64tckNow) {
 
     // challenge changes after a while
     if (gsButtonFlags.abChallenge || gsButtonFlags.abChallenge1) {
+      bool bAnyStateChange = false;
       bool bAnyPressed = false;
-      ++u32ChallengeCycles;
+      ++gu32ButtonChallengeCycles;
       for (int i = 0; i < ARRAY_SIZE(gasButtonState); ++i) {
         uint8_t u8Byte = gasButtonActions[i].u8Gpio >> 5;
         uint8_t u8Bit = gasButtonActions[i].u8Gpio & 0x1F;
@@ -440,6 +479,7 @@ static void _button_cycle(uint64_t u64tckNow) {
             gsButtonFlags.abChallenge &= ~(1 << u8Bit);
           bool bLevel = gpio_pin_read(gasButtonActions[i].u8Gpio);
           if (bLevel != gasButtonState[i].u8LastKnownState) {  // significant change!
+            bAnyStateChange = true;
             gasButtonState[i].u8LastKnownState = bLevel;
 
             uart_printf(&gsUART0, "Button#%u @%u ms %s\r\n", gasButtonActions[i].u8Gpio, (uint32_t)(TICKS2MS(u64tckNow)), bLevel ? "released" : "pressed");
@@ -462,7 +502,7 @@ static void _button_cycle(uint64_t u64tckNow) {
               }
             }
             // debug
-            uart_printf(&gsUART0, " %u %02X %08X\r\n", u32ChallengeCycles, gsButtonFlags.abChallenge1, gsButtonFlags.abChallenge);
+            uart_printf(&gsUART0, " %u %02X %08X\r\n", gu32ButtonChallengeCycles, gsButtonFlags.abChallenge1, gsButtonFlags.abChallenge);
           } else {  // only one or more spikes
           }
         }
@@ -470,6 +510,9 @@ static void _button_cycle(uint64_t u64tckNow) {
       if (bAnyPressed) {
         u64tckNextLongHold = _button_next_long_hold();
         bLongHold = true;
+      }
+      if (bAnyStateChange) {
+        ++gu32ButtonStateChangedCycles;
       }
     }
 
