@@ -7,10 +7,23 @@
 #include <stdbool.h>
 #include <inttypes.h>
 #include <stdio.h>
+#ifdef __XTENSA__
+#include <sys/reent.h>
+#if __GNUC__ >= 13
+#define IMPURE_PTR _impure_ptr
+#else
+#define IMPURE_PTR _global_impure_ptr
+#endif
+#else
+#define _impure_ptr NULL
+#define _snprintf_r(X,Y1,Y2,Y3,...) snprintf(Y1,Y2,Y3,...)
+#endif
+
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
 
+#include "temphum2-config.h"
 #include "dht22.h"
 #include "esp_attr.h"
 #include "gpio.h"
@@ -36,7 +49,6 @@
 #define DISPLAY_INITDELAY_MS   100U
 #define DISPLAY_INITPERIOD_MS  200U
 #define DISPLAY_INIT2PERIOD_MS  50U // 20 FPS
-#define DISPLAY_INIT2_FRAMES    64U // 50 * 64 = 3200ms
 #define DISPLAY_DELAY_MS        20U // DHT22 requires ~5ms to do the measurement (with interrupt, callback etc.). After 20 µs the data is certainly ready.
 #define DISPLAY_PERIOD_MS     1000U // We need 2 display periods to show temp and rhum data. Note, 2*DISPLAY_PERIOD_MS == DHT22_PERIOD_MS
 #define UART_FREQ_HZ        115200U
@@ -600,9 +612,12 @@ static void _display_cycle(uint64_t u64tckNow) {
   // for regular temp/hum display
   static uint64_t u64tckMainNext = MS2TICKS(DISPLAY_DELAY_MS);
   static E_DISPLAY_REGULAR_STATE eRegState = DISPLAY_REGULAR_RHUM;
+  static char acInitStr[40];
+  static uint8_t au8InitStr[40];
+  static uint8_t u8InitStrLen;
 
   // for init phase
-  static int8_t i8InitScrollOffset = -3;
+  static uint8_t u8InitScrollOffset = 0;
   static uint8_t u8Init2FrameIdx = 0;
 
   // aux buffer, for storing displayed data az characters
@@ -618,25 +633,25 @@ static void _display_cycle(uint64_t u64tckNow) {
 
     switch (geDisplayMajorState) {
       case DISPLAY_INIT: // scroll nums right to left
-        for (int i = 0; i < TM1637_CELLS; ++i) {
-          int idx = i + i8InitScrollOffset;
-          gau8Tm1637Data[i] = ((idx < 0 || ARRAY_SIZE(gau8NumToSeg) <= idx) ? 0 : gau8NumToSeg[idx]);
+        if (u8InitScrollOffset == 0) {
+          u8InitStrLen = _snprintf_r(IMPURE_PTR, acInitStr, ARRAY_SIZE(acInitStr), "   0123456789 - v%u.%u.%u   ", MAJOR_VERSION, MINOR_VERSION, PATCH_VERSION);
+          _asciiseq_to_seg7(au8InitStr, acInitStr, u8InitStrLen);
         }
-        ++i8InitScrollOffset;
-        if (18 < i8InitScrollOffset) {
+        for (uint8_t i = 0; i < TM1637_CELLS; ++i) {
+          gau8Tm1637Data[i] = au8InitStr[i + u8InitScrollOffset];
+        }
+        ++u8InitScrollOffset;
+        if (u8InitStrLen - 4 < u8InitScrollOffset) {
           geDisplayMajorState = DISPLAY_INIT2;
         }
         break;
-      case DISPLAY_INIT2: // display message
-        *(uint32_t*)gau8Tm1637Data = INIT2_SEGS;
-        uint8_t u8BrightCharIdx = u8Init2FrameIdx / (DISPLAY_INIT2_FRAMES / 4);
-        if ((u8Init2FrameIdx & 3) == 0) {  // every 2nd frame clr not bright characters
-          uint32_t u32Mask = 0xFF << (8 * (u8BrightCharIdx));
-          *(uint32_t*)gau8Tm1637Data &= u32Mask;
-        }
-        ++u8Init2FrameIdx;
-        if (u8Init2FrameIdx == DISPLAY_INIT2_FRAMES) {
+      case DISPLAY_INIT2: // display message, always 1 more segment
+        uint32_t u32Mask = (u8Init2FrameIdx == 32)? -1 : ((1 << u8Init2FrameIdx) - 1);
+        *(uint32_t*)gau8Tm1637Data = INIT2_SEGS & u32Mask;
+        if (u8Init2FrameIdx == 32) {
           geDisplayMajorState = DISPLAY_REGULAR;
+        } else {
+          ++u8Init2FrameIdx;
         }
         break;
       case DISPLAY_MINMAX:
@@ -713,6 +728,8 @@ static void _asciiseq_to_seg7(uint8_t *pu8Dst, const char *pcSrc, uint8_t u8Len)
             ('A' <= cSrc && cSrc <= 'F') ? gau8NumToSeg[cSrc - 'A' + 10] :
             ('a' <= cSrc && cSrc <= 'f') ? gau8NumToSeg[cSrc - 'a' + 10] :
             ('-' == cSrc) ? 0x40 :
+            ('.' == cSrc) ? 0x08 :
+            ('v' == cSrc) ? 0x1c :
             0;
   }
 }

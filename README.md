@@ -33,12 +33,13 @@ Cloning git source is preferred. It is easier to update.
 
 First, you need to run `aclocal`.
 
-Next, run `autoconf`.
+Next, run `autoheader` and `autoconf`.
 
 Finally, run `automake --add-missing`.
 
 ```sh
 aclocal
+autoheader
 autoconf
 automake --add-missing
 ```
