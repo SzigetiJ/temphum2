@@ -7,18 +7,6 @@
 #include <stdbool.h>
 #include <inttypes.h>
 #include <stdio.h>
-#ifdef __XTENSA__
-#include <sys/reent.h>
-#if __GNUC__ >= 13
-#define IMPURE_PTR _impure_ptr
-#else
-#define IMPURE_PTR _global_impure_ptr
-#endif
-#else
-#define _impure_ptr NULL
-#define _snprintf_r(X,Y1,Y2,Y3,...) snprintf(Y1,Y2,Y3,...)
-#endif
-
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
@@ -91,10 +79,10 @@
 // ============= Local types ===============
 
 typedef enum {
-  DISPLAY_INIT = 0,
-  DISPLAY_INIT2,
-  DISPLAY_REGULAR,
-  DISPLAY_MINMAX
+  DISPLAY_INIT = 0,   // scrolling numbers and version
+  DISPLAY_INIT2,      // greeting message
+  DISPLAY_REGULAR,    // alternating between temp and rhum value
+  DISPLAY_MINMAX      // min and max values announced and separated
 } E_DISPLAY_MAJOR_STATE;
 
 typedef enum {
@@ -612,9 +600,8 @@ static void _display_cycle(uint64_t u64tckNow) {
   // for regular temp/hum display
   static uint64_t u64tckMainNext = MS2TICKS(DISPLAY_DELAY_MS);
   static E_DISPLAY_REGULAR_STATE eRegState = DISPLAY_REGULAR_RHUM;
-  static char acInitStr[40];
-  static uint8_t au8InitStr[40];
-  static uint8_t u8InitStrLen;
+  static char acInitStr[] = "   0123456789 - v" VERSION "   ";
+  static uint8_t au8InitStr[ARRAY_SIZE(acInitStr)];
 
   // for init phase
   static uint8_t u8InitScrollOffset = 0;
@@ -634,14 +621,13 @@ static void _display_cycle(uint64_t u64tckNow) {
     switch (geDisplayMajorState) {
       case DISPLAY_INIT: // scroll nums right to left
         if (u8InitScrollOffset == 0) {
-          u8InitStrLen = _snprintf_r(IMPURE_PTR, acInitStr, ARRAY_SIZE(acInitStr), "   0123456789 - v%u.%u.%u   ", MAJOR_VERSION, MINOR_VERSION, PATCH_VERSION);
-          _asciiseq_to_seg7(au8InitStr, acInitStr, u8InitStrLen);
+          _asciiseq_to_seg7(au8InitStr, acInitStr, ARRAY_SIZE(acInitStr));
         }
         for (uint8_t i = 0; i < TM1637_CELLS; ++i) {
           gau8Tm1637Data[i] = au8InitStr[i + u8InitScrollOffset];
         }
         ++u8InitScrollOffset;
-        if (u8InitStrLen - 4 < u8InitScrollOffset) {
+        if (ARRAY_SIZE(acInitStr) - TM1637_CELLS < u8InitScrollOffset) {
           geDisplayMajorState = DISPLAY_INIT2;
         }
         break;
