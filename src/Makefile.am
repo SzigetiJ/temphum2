@@ -4,7 +4,7 @@ AM_LDFLAGS = @E32B_LDFLAGS@ -Wl,--gc-sections \
  -T @E32BDIR@/share/esp32peripheral.ld \
  -T @E32BDIR@/share/esp32.rom.newlib-funcs.ld 
 
-noinst_HEADERS = defines.h
+noinst_HEADERS = defines.h i16utils.h
 
 AM_CFLAGS  = -std=c11 -flto
 

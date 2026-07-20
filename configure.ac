@@ -60,7 +60,7 @@ fi
 dnl Check that we can find the main.h header file
 CPPFLAGS_SAVE="$CPPFLAGS"
 CPPFLAGS="$E32B_CPPFLAGS"
-AC_CHECK_HEADER([main.h], [], [AC_MSG_ERROR([could not find main.h - you may need to specify the directory of an esp32basic installation using --with-projdir])])
+AC_CHECK_HEADER([main.h], [], [AC_MSG_ERROR([could not find main.h - you may need to specify the directory of an esp32basic installation using --with-e32bdir])])
 CPPFLAGS="$CPPFLAGS_SAVE"
 
 AC_SUBST([E32B_CPPFLAGS])
