@@ -37,7 +37,7 @@
 #define DISPLAY_INITDELAY_MS   100U
 #define DISPLAY_INITPERIOD_MS  200U
 #define DISPLAY_INIT2PERIOD_MS  50U // 20 FPS
-#define DISPLAY_DELAY_MS        20U // DHT22 requires ~5ms to do the measurement (with interrupt, callback etc.). After 20 µs the data is certainly ready.
+#define DISPLAY_DELAY_MS        20U // DHT22 requires ~5ms to do the measurement (with interrupt, callback etc.). After 20 ms the data is certainly ready.
 #define DISPLAY_PERIOD_MS     1000U // We need 2 display periods to show temp and rhum data. Note, 2*DISPLAY_PERIOD_MS == DHT22_PERIOD_MS
 #define UART_FREQ_HZ        115200U
 #define ALIVE_BLINK_PERIOD_MS 5000U
@@ -57,8 +57,8 @@
 #define DHT22_GPIO              27U
 
 #define DHT22_RMTCH         RMT_CH0
-#define TM1637CLK_RMTCH     RMT_CH1
-#define TM1637DIO_RMTCH     RMT_CH2
+#define TM1637CLK_RMTCH     RMT_CH2
+#define TM1637DIO_RMTCH     RMT_CH1
 #define RMTINT_CH               23U
 #define BUTTONINT_CH            22U
 
@@ -936,8 +936,6 @@ void prog_init_pro_pre() {
   _dht22_init();
   _button_init();
   _measproc_init();
-
-
 }
 
 void prog_init_app() {

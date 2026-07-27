@@ -1,5 +1,5 @@
 AC_PREREQ([2.69])
-AC_INIT([temphum2],[2.0.0])
+AC_INIT([temphum2],[2.1.0])
 
 dnl Split PACKAGE_VERSION into MAJOR, MINOR and PATCH using shell parameter expansion
 MAJOR_VERSION=`echo "$PACKAGE_VERSION" | cut -d . -f 1`
